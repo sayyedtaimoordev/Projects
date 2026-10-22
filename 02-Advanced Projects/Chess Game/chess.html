@@ -246,6 +246,7 @@
   .btn.primary:hover{background:linear-gradient(180deg,#f6d69c,#d3a659)}
 
   .switch{display:flex;align-items:center;gap:10px;cursor:pointer;font-size:13px;color:#cfc7bb}
+  .switch.sound-row{margin-top:11px;padding-top:11px;border-top:1px solid rgba(255,255,255,.07)}
   .switch input{position:absolute;opacity:0;pointer-events:none}
   .track{
     width:36px;height:20px;border-radius:999px;background:rgba(255,255,255,.12);
@@ -345,6 +346,11 @@
           <span class="track"></span>
           <span>Play vs computer</span>
         </label>
+        <label class="switch sound-row">
+          <input type="checkbox" id="sound-toggle" checked>
+          <span class="track"></span>
+          <span>Sound &amp; ambience</span>
+        </label>
         <div class="btns">
           <button class="btn" id="undo">Undo</button>
           <button class="btn" id="reset">New game</button>
@@ -363,6 +369,252 @@
   <script>
   (() => {
   'use strict';
+
+  /* ================= storage utility ================= */
+  class MemoryStorage {
+    constructor() {
+      this._store = new Map();
+    }
+    getItem(key) {
+      const val = this._store.get(String(key));
+      return val !== undefined ? val : null;
+    }
+    setItem(key, value) {
+      this._store.set(String(key), String(value));
+    }
+    removeItem(key) {
+      this._store.delete(String(key));
+    }
+    clear() {
+      this._store.clear();
+    }
+    key(index) {
+      const keys = Array.from(this._store.keys());
+      return keys[index] !== undefined ? keys[index] : null;
+    }
+    get length() {
+      return this._store.size;
+    }
+  }
+
+  function probeStorage(storage) {
+    if (!storage) return false;
+    try {
+      const probeKey = '__storage_probe__' + Math.random().toString(36).slice(2);
+      storage.setItem(probeKey, '1');
+      const retrieved = storage.getItem(probeKey);
+      storage.removeItem(probeKey);
+      return retrieved === '1';
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function resolveDefaultBackend() {
+    try {
+      if (typeof window !== 'undefined' && window.localStorage) {
+        return window.localStorage;
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  class NamespacedStorage {
+    constructor(options = {}) {
+      const ns = typeof options === 'string' ? options : (options.namespace || 'chess');
+      this.namespace = String(ns).trim();
+      this.prefix = this.namespace ? `${this.namespace}:` : '';
+
+      const requestedBackend = options && typeof options === 'object' ? options.storage : undefined;
+      const candidate = requestedBackend !== undefined ? requestedBackend : resolveDefaultBackend();
+
+      if (probeStorage(candidate)) {
+        this._backend = candidate;
+        this._isMemoryFallback = false;
+      } else {
+        this._backend = new MemoryStorage();
+        this._isMemoryFallback = true;
+      }
+      this._memoryShadow = new Map();
+    }
+
+    _prefixKey(key) {
+      return `${this.prefix}${key}`;
+    }
+
+    _isNamespacedKey(fullKey) {
+      if (!this.prefix) return true;
+      return typeof fullKey === 'string' && fullKey.startsWith(this.prefix);
+    }
+
+    _stripPrefix(fullKey) {
+      if (!this.prefix) return fullKey;
+      return fullKey.slice(this.prefix.length);
+    }
+
+    get(key, defaultValue = null) {
+      if (key == null) return defaultValue;
+      const fullKey = this._prefixKey(key);
+      try {
+        let raw = null;
+        let found = false;
+        try {
+          raw = this._backend.getItem(fullKey);
+          if (raw !== null && raw !== undefined) found = true;
+        } catch (backendErr) {}
+
+        if (!found && this._memoryShadow.has(fullKey)) {
+          raw = this._memoryShadow.get(fullKey);
+          found = true;
+        }
+
+        if (!found || raw === null || raw === undefined) {
+          return defaultValue;
+        }
+
+        try {
+          return JSON.parse(raw);
+        } catch (syntaxErr) {
+          return defaultValue;
+        }
+      } catch (err) {
+        return defaultValue;
+      }
+    }
+
+    set(key, value) {
+      if (key == null) return false;
+      const fullKey = this._prefixKey(key);
+      let serialized;
+      try {
+        serialized = JSON.stringify(value);
+        if (serialized === undefined) serialized = 'null';
+      } catch (serializeErr) {
+        return false;
+      }
+
+      this._memoryShadow.set(fullKey, serialized);
+      try {
+        this._backend.setItem(fullKey, serialized);
+        return true;
+      } catch (writeErr) {
+        return false;
+      }
+    }
+
+    remove(key) {
+      if (key == null) return false;
+      const fullKey = this._prefixKey(key);
+      this._memoryShadow.delete(fullKey);
+      try {
+        this._backend.removeItem(fullKey);
+        return true;
+      } catch (err) {
+        return false;
+      }
+    }
+
+    clear() {
+      try {
+        const toRemove = [];
+        const backend = this._backend;
+        if (typeof backend.length === 'number' && typeof backend.key === 'function') {
+          for (let i = 0; i < backend.length; i++) {
+            const k = backend.key(i);
+            if (k && this._isNamespacedKey(k)) toRemove.push(k);
+          }
+        } else if (backend._store instanceof Map) {
+          for (const k of backend._store.keys()) {
+            if (this._isNamespacedKey(k)) toRemove.push(k);
+          }
+        } else {
+          for (const k in backend) {
+            if (this._isNamespacedKey(k)) toRemove.push(k);
+          }
+        }
+
+        for (const k of toRemove) {
+          try { backend.removeItem(k); } catch (e) {}
+        }
+        for (const k of Array.from(this._memoryShadow.keys())) {
+          if (this._isNamespacedKey(k)) this._memoryShadow.delete(k);
+        }
+        return true;
+      } catch (err) {
+        return false;
+      }
+    }
+
+    keys() {
+      const found = new Set();
+      try {
+        const backend = this._backend;
+        if (typeof backend.length === 'number' && typeof backend.key === 'function') {
+          for (let i = 0; i < backend.length; i++) {
+            const k = backend.key(i);
+            if (k && this._isNamespacedKey(k)) found.add(this._stripPrefix(k));
+          }
+        } else if (backend._store instanceof Map) {
+          for (const k of backend._store.keys()) {
+            if (this._isNamespacedKey(k)) found.add(this._stripPrefix(k));
+          }
+        }
+      } catch (e) {}
+
+      for (const k of this._memoryShadow.keys()) {
+        if (this._isNamespacedKey(k)) found.add(this._stripPrefix(k));
+      }
+      return Array.from(found);
+    }
+
+    has(key) {
+      if (key == null) return false;
+      const fullKey = this._prefixKey(key);
+      try {
+        const raw = this._backend.getItem(fullKey);
+        if (raw !== null && raw !== undefined) return true;
+      } catch (e) {}
+      return this._memoryShadow.has(fullKey);
+    }
+
+    isPersistent() {
+      return !this._isMemoryFallback;
+    }
+  }
+
+  function createStorage(options) {
+    return new NamespacedStorage(options);
+  }
+
+  const storage = createStorage({ namespace: 'chess' });
+  window.chessStorage = storage;
+  window.createStorage = createStorage;
+  window.MemoryStorage = MemoryStorage;
+
+  window.runStorageTests = () => {
+    let passed = 0, failed = 0;
+    function run(name, fn) {
+      try {
+        fn();
+        passed++;
+        console.log('%c✔ ' + name, 'color:#3fb950');
+      } catch (e) {
+        failed++;
+        console.error('✖ ' + name, e);
+      }
+    }
+    const mem = new MemoryStorage();
+    const t = createStorage({ namespace: 'test_ns', storage: mem });
+    run('set/get primitive', () => { t.set('a', 1); if (t.get('a') !== 1) throw new Error(); });
+    run('set/get object', () => { t.set('o', { x: 9 }); if (t.get('o').x !== 9) throw new Error(); });
+    run('namespacing prefix', () => { if (!mem.getItem('test_ns:a')) throw new Error(); });
+    run('get fallback', () => { if (t.get('none', 'def') !== 'def') throw new Error(); });
+    run('remove item', () => { t.remove('a'); if (t.has('a')) throw new Error(); });
+    run('clear namespace without affecting other keys', () => { mem.setItem('other:k', '1'); t.clear(); if (!mem.getItem('other:k')) throw new Error(); });
+    run('malformed json resilience', () => { mem.setItem('test_ns:bad', '{ invalid json'); if (t.get('bad', 'ok') !== 'ok') throw new Error(); });
+    console.log(`Storage Tests: ${passed} passed, ${failed} failed.`);
+    return { passed, failed };
+  };
 
   /* ================= constants ================= */
   const FILES = 'abcdefgh';
@@ -449,9 +701,229 @@
   const promoEl   = document.getElementById('promo');
   const promoOpts = document.getElementById('promo-opts');
   const aiToggle  = document.getElementById('ai-toggle');
+  const soundToggle = document.getElementById('sound-toggle');
   const undoBtn   = document.getElementById('undo');
   const resetBtn  = document.getElementById('reset');
   const againBtn  = document.getElementById('go-again');
+
+  /* ================= audio ================= */
+  const Sound = (() => {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    let ctx = null;
+    let master = null, sfxBus = null, padBus = null, ambBus = null;
+    let noiseBuf = null;
+    let enabled = true;
+    let started = false;
+    let arpTimer = null;
+    let pad = null;
+    let step = 0;
+
+    const SCALE = [261.63, 293.66, 329.63, 392.00, 440.00, 523.25, 587.33, 659.25];
+    const CHORDS = [
+      [130.81, 196.00, 261.63],
+      [110.00, 164.81, 220.00],
+      [146.83, 220.00, 293.66],
+      [98.00, 146.83, 196.00]
+    ];
+
+    function build(){
+      if (ctx) return ctx;
+      if (!AC) return null;
+      ctx = new AC();
+      master = ctx.createGain();
+      master.gain.value = enabled ? 0.9 : 0;
+      master.connect(ctx.destination);
+
+      sfxBus = ctx.createGain();
+      sfxBus.gain.value = 0.5;
+      sfxBus.connect(master);
+
+      padBus = ctx.createGain();
+      padBus.gain.value = 0.055;
+      padBus.connect(master);
+
+      ambBus = ctx.createGain();
+      ambBus.gain.value = 0.05;
+      ambBus.connect(master);
+
+      const len = Math.floor(ctx.sampleRate * 1.2);
+      noiseBuf = ctx.createBuffer(1, len, ctx.sampleRate);
+      const data = noiseBuf.getChannelData(0);
+      for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+      return ctx;
+    }
+
+    function noise(t, dur, freq, gain, type){
+      const src = ctx.createBufferSource();
+      src.buffer = noiseBuf;
+      const f = ctx.createBiquadFilter();
+      f.type = type || 'bandpass';
+      f.frequency.value = freq;
+      f.Q.value = type === 'bandpass' ? 1.2 : 0.7;
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(gain, t + 0.006);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      src.connect(f).connect(g).connect(sfxBus);
+      src.start(t);
+      src.stop(t + dur + 0.02);
+    }
+
+    function tone(t, freq, dur, gain, type, glideTo){
+      const osc = ctx.createOscillator();
+      osc.type = type || 'sine';
+      osc.frequency.setValueAtTime(freq, t);
+      if (glideTo) osc.frequency.exponentialRampToValueAtTime(glideTo, t + dur * 0.9);
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(gain, t + 0.012);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      osc.connect(g).connect(sfxBus);
+      osc.start(t);
+      osc.stop(t + dur + 0.02);
+    }
+
+    function startPad(){
+      if (pad || !ctx) return;
+      const t = ctx.currentTime;
+      const filter = ctx.createBiquadFilter();
+      filter.type = 'lowpass';
+      filter.frequency.value = 620;
+      filter.Q.value = 0.6;
+
+      const lfo = ctx.createOscillator();
+      lfo.frequency.value = 0.06;
+      const lfoGain = ctx.createGain();
+      lfoGain.gain.value = 180;
+      lfo.connect(lfoGain).connect(filter.frequency);
+
+      const g = ctx.createGain();
+      g.gain.value = 0.5;
+      filter.connect(g).connect(padBus);
+
+      const voices = CHORDS[0].map(f => {
+        const o = ctx.createOscillator();
+        o.type = 'sine';
+        o.frequency.value = f;
+        o.detune.value = (Math.random() - 0.5) * 8;
+        o.connect(filter);
+        o.start(t);
+        return o;
+      });
+      lfo.start(t);
+
+      pad = { voices, filter, gain: g, lfo, lfoGain, chord: 0 };
+
+      arpTimer = setInterval(() => {
+        if (!ctx || !enabled || ctx.state !== 'running') return;
+        const now = ctx.currentTime + 0.05;
+        if (step % 16 === 0){
+          pad.chord = (pad.chord + 1) % CHORDS.length;
+          const chord = CHORDS[pad.chord];
+          pad.voices.forEach((v, i) => {
+            v.frequency.setTargetAtTime(chord[i], now, 2.4);
+          });
+        }
+        if (Math.random() < 0.55){
+          const f = SCALE[Math.floor(Math.random() * SCALE.length)] * (Math.random() < 0.3 ? 0.5 : 1);
+          const osc = ctx.createOscillator();
+          osc.type = 'triangle';
+          osc.frequency.value = f;
+          const g = ctx.createGain();
+          const peak = 0.16 + Math.random() * 0.08;
+          g.gain.setValueAtTime(0.0001, now);
+          g.gain.exponentialRampToValueAtTime(peak, now + 0.03);
+          g.gain.exponentialRampToValueAtTime(0.0001, now + 1.5);
+          osc.connect(g).connect(ambBus);
+          osc.start(now);
+          osc.stop(now + 1.6);
+        }
+        step++;
+      }, 1500);
+    }
+
+    function start(){
+      if (!enabled) return;
+      if (!build()) return;
+      if (ctx.state === 'suspended') ctx.resume();
+      if (!started){
+        started = true;
+        startPad();
+      }
+    }
+
+    function setEnabled(on){
+      enabled = !!on;
+      if (!ctx){
+        if (enabled) start();
+        return;
+      }
+      const t = ctx.currentTime;
+      master.gain.cancelScheduledValues(t);
+      master.gain.setTargetAtTime(enabled ? 0.9 : 0, t, 0.08);
+      if (enabled){
+        if (ctx.state === 'suspended') ctx.resume();
+        if (!started){ started = true; startPad(); }
+      }
+    }
+
+    function isEnabled(){ return enabled; }
+
+    function suspend(){ if (ctx && ctx.state === 'running') ctx.suspend(); }
+    function resume(){ if (ctx && enabled && ctx.state === 'suspended') ctx.resume(); }
+
+    function move(){
+      if (!enabled || !ctx) return;
+      const t = ctx.currentTime;
+      noise(t, 0.05, 1900, 0.16, 'highpass');
+      tone(t, 190, 0.11, 0.22, 'sine', 85);
+    }
+
+    function capture(){
+      if (!enabled || !ctx) return;
+      const t = ctx.currentTime;
+      noise(t, 0.13, 900, 0.4, 'bandpass');
+      noise(t + 0.01, 0.07, 2600, 0.2, 'highpass');
+      tone(t, 240, 0.18, 0.3, 'triangle', 62);
+      tone(t + 0.02, 520, 0.09, 0.12, 'square', 180);
+    }
+
+    function check(){
+      if (!enabled || !ctx) return;
+      const t = ctx.currentTime + 0.02;
+      tone(t, 880, 0.16, 0.13, 'sine');
+      tone(t + 0.13, 1174.66, 0.22, 0.1, 'sine');
+    }
+
+    function promote(){
+      if (!enabled || !ctx) return;
+      const t = ctx.currentTime + 0.02;
+      [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => {
+        tone(t + i * 0.075, f, 0.3, 0.11, 'triangle');
+      });
+    }
+
+    function end(kind){
+      if (!enabled || !ctx) return;
+      const t = ctx.currentTime + 0.05;
+      const sets = {
+        win:  [392.00, 493.88, 587.33, 783.99],
+        lose: [440.00, 349.23, 293.66, 220.00],
+        draw: [392.00, 466.16, 392.00]
+      };
+      (sets[kind] || sets.draw).forEach((f, i) => {
+        tone(t + i * 0.16, f, 0.75, 0.11, 'sine');
+      });
+      noise(t, 0.5, 320, 0.05, 'lowpass');
+    }
+
+    function select(){
+      if (!enabled || !ctx) return;
+      tone(ctx.currentTime, 660, 0.05, 0.05, 'sine');
+    }
+
+    return { start, setEnabled, isEnabled, suspend, resume, move, capture, check, promote, end, select };
+  })();
 
   /* ================= state ================= */
   let uid = 1;
@@ -475,6 +947,94 @@
   const sqEl = (r,c) => squareEls[r*8+c];
   const pos = (r,c) => `translate(${c*100}%,${r*100}%)`;
   const cloneBoard = b => b.map(row => row.map(p => p ? {...p} : null));
+
+  /* ================= persistence ================= */
+  function findMaxPieceId(board, hist){
+    let max = 0;
+    const scan = b => {
+      if (!Array.isArray(b)) return;
+      for (let r = 0; r < 8; r++){
+        if (!Array.isArray(b[r])) continue;
+        for (let c = 0; c < 8; c++){
+          const p = b[r][c];
+          if (p && typeof p.id === 'number' && p.id > max) max = p.id;
+        }
+      }
+    };
+    scan(board);
+    if (Array.isArray(hist)){
+      for (const h of hist){
+        if (h && h.snapshot) scan(h.snapshot.board);
+      }
+    }
+    return max;
+  }
+
+  function saveGame(){
+    storage.set('game', {
+      state,
+      history,
+      lastMove,
+      gameOver,
+      uid
+    });
+  }
+
+  function loadGame(){
+    const saved = storage.get('game', null);
+    if (!saved || typeof saved !== 'object') return false;
+    const st = saved.state;
+    if (!st || !Array.isArray(st.board) || st.board.length !== 8) return false;
+    for (let r = 0; r < 8; r++){
+      if (!Array.isArray(st.board[r]) || st.board[r].length !== 8) return false;
+    }
+    if (st.turn !== 'w' && st.turn !== 'b') return false;
+    if (!st.castling || typeof st.castling !== 'object') return false;
+
+    state = {
+      board: st.board,
+      turn: st.turn,
+      castling: {
+        wK: !!st.castling.wK,
+        wQ: !!st.castling.wQ,
+        bK: !!st.castling.bK,
+        bQ: !!st.castling.bQ
+      },
+      ep: Array.isArray(st.ep) && st.ep.length === 2 ? [st.ep[0], st.ep[1]] : null,
+      halfmove: typeof st.halfmove === 'number' ? st.halfmove : 0,
+      fullmove: typeof st.fullmove === 'number' ? st.fullmove : 1
+    };
+
+    history = Array.isArray(saved.history) ? saved.history : [];
+    lastMove = saved.lastMove && saved.lastMove.from && saved.lastMove.to
+      ? { from: [...saved.lastMove.from], to: [...saved.lastMove.to] }
+      : null;
+    gameOver = saved.gameOver || null;
+    const maxId = findMaxPieceId(state.board, history);
+    uid = typeof saved.uid === 'number' && saved.uid > maxId ? saved.uid : (maxId + 1);
+    return true;
+  }
+
+  function saveSettings(){
+    storage.set('settings', {
+      sound: soundToggle.checked,
+      vsAI: vsAI
+    });
+  }
+
+  function loadSettings(){
+    const saved = storage.get('settings', null);
+    if (saved && typeof saved === 'object'){
+      if (typeof saved.sound === 'boolean'){
+        soundToggle.checked = saved.sound;
+        Sound.setEnabled(saved.sound);
+      }
+      if (typeof saved.vsAI === 'boolean'){
+        vsAI = saved.vsAI;
+        aiToggle.checked = vsAI;
+      }
+    }
+  }
 
   function newState(){
     const board = Array.from({length:8}, () => Array(8).fill(null));
@@ -1004,6 +1564,19 @@
     renderMoves();
     updateStatus();
     impact(to[0], to[1], !!captured);
+
+    if (captured) Sound.capture();
+    else Sound.move();
+    if (m.promotion) setTimeout(() => Sound.promote(), 190);
+    if (check && !(gameOver && gameOver.type === 'checkmate')) setTimeout(() => Sound.check(), 180);
+    if (gameOver){
+      const kind = gameOver.type === 'checkmate'
+        ? (gameOver.winner === 'w' ? 'win' : 'lose')
+        : 'draw';
+      setTimeout(() => Sound.end(kind), 320);
+    }
+
+    saveGame();
     maybeAI();
   }
 
@@ -1107,6 +1680,7 @@
     selected = [r, c];
     legalCache = allLegalMoves(state).filter(m => m.from[0] === r && m.from[1] === c);
     updateUI();
+    Sound.select();
   }
 
   function onSquare(r, c){
@@ -1182,6 +1756,7 @@
     updateUI();
     renderMoves();
     updateStatus();
+    saveGame();
   }
 
   function newGame(){
@@ -1200,6 +1775,7 @@
     updateUI();
     renderMoves();
     updateStatus();
+    saveGame();
     maybeAI();
   }
 
@@ -1210,6 +1786,11 @@
     onSquare(+sq.dataset.r, +sq.dataset.c);
   });
 
+  soundToggle.addEventListener('change', () => {
+    Sound.setEnabled(soundToggle.checked);
+    saveSettings();
+  });
+
   aiToggle.addEventListener('change', () => {
     vsAI = aiToggle.checked;
     if (!vsAI){
@@ -1217,6 +1798,7 @@
       aiThinking = false;
     }
     updateStatus();
+    saveSettings();
     maybeAI();
   });
 
@@ -1233,6 +1815,11 @@
     if (e.target && /input|textarea/i.test(e.target.tagName)) return;
     if (e.key === 'u' || e.key === 'U') undo();
     if (e.key === 'n' || e.key === 'N') newGame();
+    if (e.key === 'm' || e.key === 'M'){
+      soundToggle.checked = !soundToggle.checked;
+      Sound.setEnabled(soundToggle.checked);
+      saveSettings();
+    }
     if (e.key === 'Escape'){
       if (pendingPromo) closePromotion();
       else {
@@ -1243,13 +1830,37 @@
     }
   });
 
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) Sound.suspend();
+    else Sound.resume();
+  });
+
+  const kickAudio = (e) => {
+    if (e && e.target && e.target.closest && e.target.closest('.sound-row')) return;
+    if (soundToggle.checked) Sound.start();
+    window.removeEventListener('pointerdown', kickAudio);
+    window.removeEventListener('keydown', kickAudio);
+  };
+  window.addEventListener('pointerdown', kickAudio);
+  window.addEventListener('keydown', kickAudio);
+
   /* ================= init ================= */
   buildBoard();
-  state = newState();
-  rebuildPieces(true);
+  loadSettings();
+  const restored = loadGame();
+  if (!restored){
+    state = newState();
+    rebuildPieces(true);
+    saveGame();
+  } else {
+    rebuildPieces(false);
+  }
   updateUI();
   renderMoves();
   updateStatus();
+  if (restored && vsAI && state.turn === 'b' && !gameOver){
+    maybeAI();
+  }
   })();
 </script>
 </body>
